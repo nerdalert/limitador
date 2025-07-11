@@ -219,6 +219,13 @@ async fn check_and_report(
                     is_rate_limited.limit_name.as_deref(),
                     &ctx,
                 );
+                // Track token attempts associated with limited requests
+                rate_limit_data.metrics().incr_limited_hits(
+                    &namespace,
+                    is_rate_limited.limit_name.as_deref(),
+                    &ctx,
+                    delta,
+                );
 
                 match response_headers {
                     None => HttpResponse::TooManyRequests().json(()),

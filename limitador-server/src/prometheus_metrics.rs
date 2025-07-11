@@ -6,9 +6,13 @@ use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tracing::info;
 
 const NAMESPACE_LABEL: &str = "limitador_namespace";
 const LIMIT_NAME_LABEL: &str = "limit_name";
+const MODEL_LABEL: &str = "model";
+const USER_LABEL: &str = "user";
+const GROUP_LABEL: &str = "group";
 
 pub struct PrometheusMetrics {
     prometheus_handle: Arc<PrometheusHandle>,
@@ -66,6 +70,8 @@ impl PrometheusMetrics {
         );
         describe_counter!("authorized_calls", "Authorized calls");
         describe_counter!("limited_calls", "Limited calls");
+        describe_counter!("authorized_token_hits", "Authorized tokens/hits");
+        describe_counter!("limited_hits", "Limited tokens/hits");
         describe_gauge!("limitador_up", "Limitador is running");
         gauge!("limitador_up").set(1);
         describe_gauge!(
@@ -90,6 +96,7 @@ impl PrometheusMetrics {
             .expect("failed to create prometheus metrics exporter")
     }
 
+    // Existing API: increments authorized calls (no hits), using labels from CEL ctx
     pub fn incr_authorized_calls(
         &self,
         namespace: &Namespace,
@@ -98,8 +105,35 @@ impl PrometheusMetrics {
     ) {
         let mut labels: Vec<(String, String)> = self.labels(cel_ctx);
         labels.push((NAMESPACE_LABEL.to_string(), namespace.as_ref().to_string()));
+        labels.push((MODEL_LABEL.to_string(), Self::model_from_namespace(namespace.as_ref())));
         counter!("authorized_calls", &labels).increment(1);
-        counter!("authorized_hits", &labels).increment(hits_addend);
+        counter!("authorized_token_hits", &labels).increment(hits_addend);
+    }
+
+    pub fn incr_authorized_calls_with_user_and_group(
+        &self,
+        namespace: &Namespace,
+        user: Option<&str>,
+        group: Option<&str>,
+        hits_addend: u64,
+    ) {
+        let mut labels: Vec<(String, String)> = vec![(
+            NAMESPACE_LABEL.to_string(),
+            namespace.as_ref().to_string(),
+        )];
+        labels.push((MODEL_LABEL.to_string(), Self::model_from_namespace(namespace.as_ref())));
+        if let Some(user_id) = user {
+            labels.push((USER_LABEL.to_string(), user_id.to_string()));
+        }
+        if let Some(group_id) = group {
+            labels.push((GROUP_LABEL.to_string(), group_id.to_string()));
+        }
+        info!(
+            "PROMETHEUS: Incrementing authorized_calls with labels: {:?}",
+            labels
+        );
+        counter!("authorized_calls", &labels).increment(1);
+        counter!("authorized_token_hits", &labels).increment(hits_addend);
     }
 
     pub fn incr_limited_calls<'a, LN>(
@@ -112,6 +146,7 @@ impl PrometheusMetrics {
     {
         let mut labels: Vec<(String, String)> = self.labels(cel_ctx);
         labels.push((NAMESPACE_LABEL.to_string(), namespace.as_ref().to_string()));
+        labels.push((MODEL_LABEL.to_string(), Self::model_from_namespace(namespace.as_ref())));
 
         if self.use_limit_name_label {
             // If we have configured the metric to accept 2 labels we need to
@@ -121,7 +156,106 @@ impl PrometheusMetrics {
                 limit_name.into().unwrap_or("").to_string(),
             ));
         }
+        info!("PROMETHEUS: Incrementing limited_calls with labels: {:?}", labels);
         counter!("limited_calls", &labels).increment(1)
+    }
+
+    pub fn incr_limited_hits<'a, LN>(
+        &self,
+        namespace: &Namespace,
+        limit_name: LN,
+        cel_ctx: &Context,
+        hits_addend: u64,
+    ) where
+        LN: Into<Option<&'a str>>,
+    {
+        let mut labels: Vec<(String, String)> = self.labels(cel_ctx);
+        labels.push((NAMESPACE_LABEL.to_string(), namespace.as_ref().to_string()));
+        labels.push((MODEL_LABEL.to_string(), Self::model_from_namespace(namespace.as_ref())));
+
+        if self.use_limit_name_label {
+            labels.push((
+                LIMIT_NAME_LABEL.to_string(),
+                limit_name.into().unwrap_or("").to_string(),
+            ));
+        }
+        counter!("limited_hits", &labels).increment(hits_addend)
+    }
+
+    pub fn incr_limited_calls_with_user_and_group<'a, LN>(
+        &self,
+        namespace: &Namespace,
+        limit_name: LN,
+        user: Option<&str>,
+        group: Option<&str>,
+    ) where
+        LN: Into<Option<&'a str>>,
+    {
+        let mut labels: Vec<(String, String)> = vec![
+            (NAMESPACE_LABEL.to_string(), namespace.as_ref().to_string()),
+        ];
+        labels.push((MODEL_LABEL.to_string(), Self::model_from_namespace(namespace.as_ref())));
+
+        if self.use_limit_name_label {
+            labels.push((
+                LIMIT_NAME_LABEL.to_string(),
+                limit_name.into().unwrap_or("").to_string(),
+            ));
+        }
+
+        if let Some(user_id) = user {
+            labels.push((USER_LABEL.to_string(), user_id.to_string()));
+        }
+        if let Some(group_id) = group {
+            labels.push((GROUP_LABEL.to_string(), group_id.to_string()));
+        }
+
+        info!("PROMETHEUS: Incrementing limited_calls with labels: {:?}", labels);
+        counter!("limited_calls", &labels).increment(1)
+    }
+
+    pub fn incr_limited_hits_with_user_and_group<'a, LN>(
+        &self,
+        namespace: &Namespace,
+        limit_name: LN,
+        user: Option<&str>,
+        group: Option<&str>,
+        hits_addend: u64,
+    ) where
+        LN: Into<Option<&'a str>>,
+    {
+        let mut labels: Vec<(String, String)> = vec![
+            (NAMESPACE_LABEL.to_string(), namespace.as_ref().to_string()),
+        ];
+        labels.push((MODEL_LABEL.to_string(), Self::model_from_namespace(namespace.as_ref())));
+
+        if self.use_limit_name_label {
+            labels.push((
+                LIMIT_NAME_LABEL.to_string(),
+                limit_name.into().unwrap_or("").to_string(),
+            ));
+        }
+
+        if let Some(user_id) = user {
+            labels.push((USER_LABEL.to_string(), user_id.to_string()));
+        }
+        if let Some(group_id) = group {
+            labels.push((GROUP_LABEL.to_string(), group_id.to_string()));
+        }
+        counter!("limited_hits", &labels).increment(hits_addend)
+    }
+
+    fn model_from_namespace(ns: &str) -> String {
+        // Expect formats like: "llm/<name>-domain-route" or "llm/<name>-predictor"
+        // Derive model name generically by taking last path segment and
+        // stripping known suffixes.
+        let base = ns.rsplit('/').next().unwrap_or(ns);
+        for suf in ["-domain-route", "-predictor", "-route"] {
+            if let Some(stripped) = base.strip_suffix(suf) {
+                return stripped.to_string();
+            }
+        }
+        base.to_string()
     }
 
     pub fn gather_metrics(&self) -> String {
@@ -213,7 +347,7 @@ mod tests {
                 .iter()
                 .for_each(|(namespace, auth_count)| {
                     assert!(metrics_output.contains(&formatted_counter_with_namespace(
-                        "authorized_hits",
+                        "authorized_token_hits",
                         *auth_count * 3,
                         namespace
                     )));

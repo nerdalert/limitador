@@ -64,6 +64,7 @@ mod http_api;
 mod config;
 mod metrics;
 pub mod prometheus_metrics;
+mod openai_debug;
 
 const LIMITADOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LIMITADOR_PROFILE: &str = env!("LIMITADOR_PROFILE");

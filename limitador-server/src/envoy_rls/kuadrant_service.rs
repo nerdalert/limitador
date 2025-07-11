@@ -6,16 +6,19 @@ use tonic::{Request, Response, Status};
 use super::server::custom::service::ratelimit::v1::rate_limit_service_server::RateLimitService;
 use super::server::envoy::service::ratelimit::v3::rate_limit_response::Code;
 use super::server::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
+use crate::prometheus_metrics::PrometheusMetrics;
 use crate::Limiter;
 use limitador::limit::Context;
+use crate::openai_debug::log_openai_debug;
 
 pub struct KuadrantService {
     limiter: Arc<Limiter>,
+    metrics: Arc<PrometheusMetrics>,
 }
 
 impl KuadrantService {
-    pub fn new(limiter: Arc<Limiter>) -> Self {
-        Self { limiter }
+    pub fn new(limiter: Arc<Limiter>, metrics: Arc<PrometheusMetrics>) -> Self {
+        Self { limiter, metrics }
     }
 }
 
@@ -46,16 +49,31 @@ impl RateLimitService for KuadrantService {
 
         let namespace = namespace.into();
 
+        // Extract user/group from descriptors for metrics labeling
+        let mut user_id: Option<String> = None;
+        let mut group: Option<String> = None;
+
+        let mut flat_map: HashMap<String, String> = HashMap::default();
         for descriptor in &req.descriptors {
             let mut map = HashMap::default();
             for entry in &descriptor.entries {
+                if entry.key == "auth.identity.userid" {
+                    user_id = Some(entry.value.clone());
+                }
+                if entry.key == "auth.identity.metadata.annotations.kuadrant.io/groups" {
+                    group = Some(entry.value.clone());
+                }
                 map.insert(entry.key.clone(), entry.value.clone());
+                flat_map.insert(entry.key.clone(), entry.value.clone());
             }
             values.push(map);
         }
 
         let mut ctx = Context::default();
         ctx.list_binding("descriptors".to_string(), values);
+
+        // Best-effort OpenAI request debug logging (opt-in via env)
+        log_openai_debug(&flat_map, None);
 
         let rate_limited_resp = match &*self.limiter {
             Limiter::Blocking(limiter) => limiter.is_rate_limited(&namespace, &ctx, 1),
@@ -76,11 +94,27 @@ impl RateLimitService for KuadrantService {
             return Err(Status::unavailable("Service unavailable"));
         }
 
-        let resp_code = if rate_limited_resp.unwrap() {
-            Code::OverLimit
+        let limited = rate_limited_resp.unwrap();
+
+        // Increment metrics: limited calls on overlimit, authorized_calls on OK (hits added in report)
+        if limited {
+            self.metrics.incr_limited_calls_with_user_and_group(
+                &namespace,
+                None,
+                user_id.as_deref(),
+                group.as_deref(),
+            );
         } else {
-            Code::Ok
-        };
+            // increment authorized_calls without adding hits yet
+            self.metrics.incr_authorized_calls_with_user_and_group(
+                &namespace,
+                user_id.as_deref(),
+                group.as_deref(),
+                0,
+            );
+        }
+
+        let resp_code = if limited { Code::OverLimit } else { Code::Ok };
 
         let reply = RateLimitResponse {
             overall_code: resp_code.into(),
@@ -120,16 +154,31 @@ impl RateLimitService for KuadrantService {
 
         let namespace = namespace.into();
 
+        // Extract user/group from descriptors for metrics labeling
+        let mut user_id: Option<String> = None;
+        let mut group: Option<String> = None;
+
+        let mut flat_map: HashMap<String, String> = HashMap::default();
         for descriptor in &req.descriptors {
             let mut map = HashMap::default();
             for entry in &descriptor.entries {
+                if entry.key == "auth.identity.userid" {
+                    user_id = Some(entry.value.clone());
+                }
+                if entry.key == "auth.identity.metadata.annotations.kuadrant.io/groups" {
+                    group = Some(entry.value.clone());
+                }
                 map.insert(entry.key.clone(), entry.value.clone());
+                flat_map.insert(entry.key.clone(), entry.value.clone());
             }
             values.push(map);
         }
 
         let mut ctx = Context::default();
         ctx.list_binding("descriptors".to_string(), values);
+
+        // Best-effort OpenAI request debug logging (opt-in via env)
+        log_openai_debug(&flat_map, Some(req.hits_addend as u64));
 
         let rate_limited_resp = match &*self.limiter {
             Limiter::Blocking(limiter) => {
@@ -155,6 +204,14 @@ impl RateLimitService for KuadrantService {
             error!("Error: {:?}", e);
             return Err(Status::unavailable("Service unavailable"));
         }
+
+        // Record token increments on report
+        self.metrics.incr_authorized_calls_with_user_and_group(
+            &namespace,
+            user_id.as_deref(),
+            group.as_deref(),
+            req.hits_addend as u64,
+        );
 
         let reply = RateLimitResponse {
             overall_code: Code::Ok as i32,
@@ -209,7 +266,10 @@ mod tests {
             let limiter = RateLimiter::new(10_000);
             limiter.add_limit(limit);
 
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: namespace.to_string(),
@@ -264,7 +324,10 @@ mod tests {
             let limiter = RateLimiter::new(10_000);
             limiter.add_limit(limit);
 
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: namespace.to_string(),
@@ -299,7 +362,10 @@ mod tests {
         async fn test_returns_ok_when_no_limits_apply() {
             // No limits saved
             let limiter = RateLimiter::new(10_000);
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: "test_namespace".to_string(),
@@ -326,7 +392,10 @@ mod tests {
         #[tokio::test]
         async fn test_returns_unknown_when_domain_is_empty() {
             let limiter = RateLimiter::new(10_000);
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: "".to_string(),
@@ -385,7 +454,10 @@ mod tests {
                 limiter.add_limit(limit);
             });
 
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: namespace.to_string(),
@@ -456,7 +528,10 @@ mod tests {
             let limiter = RateLimiter::new(10_000);
             limiter.add_limit(limit);
 
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: namespace.to_string(),
@@ -502,7 +577,10 @@ mod tests {
             let limiter = RateLimiter::new(10_000);
             limiter.add_limit(limit);
 
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: namespace.to_string(),
@@ -534,7 +612,10 @@ mod tests {
         async fn test_returns_ok_when_no_limits_apply() {
             // No limits saved
             let limiter = RateLimiter::new(10_000);
-            let rate_limiter = KuadrantService::new(Arc::new(Limiter::Blocking(limiter)));
+            let rate_limiter = KuadrantService::new(
+                Arc::new(Limiter::Blocking(limiter)),
+                Arc::new(crate::prometheus_metrics::PrometheusMetrics::new()),
+            );
 
             let req = RateLimitRequest {
                 domain: "test_namespace".to_string(),
